@@ -1,57 +1,80 @@
 apiVersion: elasticsearch.k8s.elastic.co/v1
 kind: Elasticsearch
 metadata:
-  name: elasticsearch-cluster # Name of your Elasticsearch cluster
-  namespace: elastic-data    # Deploy into the 'elastic-data' namespace
+  name: elasticsearch-ha
 spec:
-  version: "8.13.4" # IMPORTANT: Verify this version is compatible with your ECK operator and meets your needs.
-  auth: {} # Enables default authentication. ECK will generate credentials.
-  http:
-    tls:
-      selfSignedCertificate:
-        disabled: false # Uses self-signed certificates for HTTP by default. Consider your own for production.
+  version: 8.11.4
   nodeSets:
-  - name: master # Dedicated master nodes
+  - name: main
     count: 3
-    config:
-      node.roles: ["master", "remote_cluster_client"]
-    podTemplate:
-      spec:
-        containers:
-        - name: elasticsearch
-          resources: # Starting resources for master nodes. Monitor and adjust.
-            requests:
-              memory: "4Gi"
-              cpu: "1"
-            limits:
-              memory: "4Gi"
-              cpu: "2"
-
-  - name: data # Dedicated data nodes
-    count: 3    # For 3TB primary data + 1 replica = 6TB total. (6TB / 3 nodes = 2TB per node)
-    config:
-      node.roles: ["data", "ingest", "ml", "transform"] # Common roles for data nodes
-      node.store.allow_mmap: false # CRITICAL: Due to GKE Autopilot restrictions.
-    podTemplate:
-      spec:
-        containers:
-        - name: elasticsearch
-          resources: # Starting resources for data nodes. Monitor performance and costs, then adjust.
-            requests:
-              memory: "16Gi"
-              cpu: "2"
-            limits:
-              memory: "16Gi" # Consider if your GKE Autopilot quotas/limits allow this per pod.
-              cpu: "4"
     volumeClaimTemplates:
     - metadata:
-        name: elasticsearch-data # ECK requires this specific name for the data volume.
+        name: elasticsearch-data
       spec:
         accessModes:
         - ReadWriteOnce
         resources:
           requests:
-            storage: "2Ti" # 2 Terabytes per data node. This is a significant amount of storage.
-                           # Double-check costs and that your GKE project quotas allow this.
-        # storageClassName: "premium-rwo" # Optional: For GKE SSD performance (higher cost).
-                                         # If commented out, the GKE cluster's default StorageClass will be used (usually 'standard-rwo').
+            storage: 2Ti
+        storageClassName: ha-regional
+    config:
+      node.store.allow_mmap: false
+    podTemplate:
+      metadata:
+        labels:
+          app.stateful/component: elasticsearch
+      spec:
+        initContainers:
+        - name: max-map-count-check
+          command: ['sh', '-c', "while true; do mmc=$(cat /proc/sys/vm/max_map_count); if [ ${mmc} -eq 262144 ]; then exit 0; fi; sleep 1; done"]
+        containers:
+        - name: metrics
+          image: quay.io/prometheuscommunity/elasticsearch-exporter:v1.7.0
+          command:
+            - /bin/elasticsearch_exporter
+            - --es.ssl-skip-verify
+            - --es.uri=https://$(ES_USER):$(ES_PASSWORD)@localhost:9200
+          securityContext:
+            runAsNonRoot: true
+            runAsGroup: 10000
+            runAsUser: 10000
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "25m"
+            limits:
+              memory: "128Mi"
+              cpu: "100m"
+          ports:
+          - containerPort: 9114
+          env:
+          - name: ES_USER
+            value: "elastic"
+          - name: ES_PASSWORD
+            valueFrom:
+              secretKeyRef:
+                name: elasticsearch-ha-es-elastic-user
+                key: elastic
+        - name: elasticsearch
+          resources:
+            limits:
+              memory: 16Gi
+              cpu: 4
+        affinity:
+          nodeAffinity:
+            preferredDuringSchedulingIgnoredDuringExecution:
+              - weight: 1
+                preference:
+                  matchExpressions:
+                  - key: app.stateful/component
+                    operator: In
+                    values:
+                    - elasticsearch
+          podAntiAffinity:
+            preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 1
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app.stateful/component: elasticsearch
+                topologyKey: topology.kubernetes.io/zone
